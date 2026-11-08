@@ -1,6 +1,7 @@
 import re
 import shlex
 import subprocess
+import time
 from collections.abc import Callable
 
 from .domain import ProvisionedAccess
@@ -98,19 +99,30 @@ class SshProvisioner:
     def _run_ipavlov(self, arguments: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         if not self.ipa_password:
             raise ProvisioningError("IPA password not configured")
-        return self.run(
-            [
-                "ssh",
-                *SSH_OPTIONS,
-                *self._target("ipavlov"),
-                shlex.join([IPAVLOV_HELPER, *arguments]),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            input=f"{self.ipa_password}\n",
-        )
+        command = [
+            "ssh",
+            *SSH_OPTIONS,
+            *self._target("ipavlov"),
+            shlex.join([IPAVLOV_HELPER, *arguments]),
+        ]
+        completed = None
+        for attempt in range(3):
+            completed = self.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                input=f"{self.ipa_password}\n",
+            )
+            # returncode 255 is an SSH transport failure (the vv_h200 jump dropped
+            # the connection, reset it, or timed out); the helper itself exits 0-4.
+            # Retry the transport failure instead of failing the whole request.
+            if completed.returncode != 255:
+                break
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+        return completed
 
     @staticmethod
     def _ipavlov_password(stdout: str) -> str:
@@ -195,17 +207,25 @@ class SshProvisioner:
             ):
                 raise ProvisioningError("invalid ipavlov application")
             completed = self._run_ipavlov(["add", username, full_name], timeout=120)
+            created = True
             if completed.returncode != 0:
-                raise ProvisioningError(
-                    f"ipavlov: {_helper_failure(completed.stderr, completed.returncode)}"
-                )
+                # Account already in the brainlab pool (repeat request, or a prior
+                # partial failure): reissue a password with reset instead of a hard
+                # error, so provisioning is idempotent.
+                if "already exists" in completed.stderr:
+                    completed = self._run_ipavlov(["reset", username], timeout=120)
+                    created = False
+                if completed.returncode != 0:
+                    raise ProvisioningError(
+                        f"ipavlov: {_helper_failure(completed.stderr, completed.returncode)}"
+                    )
             return ProvisionedAccess(
                 host="ipavlov",
                 username=username,
                 password=self._ipavlov_password(completed.stdout),
                 connection=IPAVLOV_CONNECTION.format(user=username),
                 group_url="",
-                created=True,
+                created=created,
             )
         if host == "alibaba_ascend":
             if (
