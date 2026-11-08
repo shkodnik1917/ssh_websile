@@ -1295,6 +1295,49 @@ class Storage:
                     reserved.append((str(row["request_id"]), application))
         return tuple(reserved)
 
+    def reserve_due_request_reminders(
+        self, *, now: int, legacy_after_seconds: int = 86400
+    ) -> tuple[tuple[str, Application], ...]:
+        # Server (non-Alibaba) requests whose reminder is due. Requests saved
+        # before server reminders existed have no next_reminder_at; they become
+        # due once they are a day old, so nothing needs a migration.
+        reserved: list[tuple[str, Application]] = []
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """
+                SELECT request_id, payload FROM pending_requests
+                WHERE status = 'pending'
+                  AND (
+                    (next_reminder_at IS NOT NULL AND next_reminder_at <= ?)
+                    OR (
+                      next_reminder_at IS NULL
+                      AND CAST(strftime('%s', created_at) AS INTEGER) <= ?
+                    )
+                  )
+                  AND (
+                    reminder_reserved_at IS NULL
+                    OR reminder_reserved_at <= ?
+                  )
+                ORDER BY created_at, request_id
+                """,
+                (now, now - legacy_after_seconds, now - 600),
+            ).fetchall()
+            for row in rows:
+                application = self._pending_application(str(row["payload"]))
+                if "alibaba_ascend" in application.servers:
+                    continue
+                updated = db.execute(
+                    """
+                    UPDATE pending_requests SET reminder_reserved_at = ?
+                    WHERE request_id = ? AND status = 'pending'
+                    """,
+                    (now, str(row["request_id"])),
+                )
+                if updated.rowcount == 1:
+                    reserved.append((str(row["request_id"]), application))
+        return tuple(reserved)
+
     def mark_pending_reminder_sent(
         self, request_id: str, *, now: int, interval_seconds: int = 86400
     ) -> None:

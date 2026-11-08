@@ -100,6 +100,7 @@ LAB_CHAT_LINE = (
 FORM_URL = f"{RULES_URL}/access-form.html"
 SERVER_FORM_URL = f"{RULES_URL}/server-form.html"
 ASCEND_REMINDER_INTERVAL_SECONDS = 86400
+REQUEST_REMINDER_INTERVAL_SECONDS = 86400
 SHEETS_RECONCILIATION_INTERVAL_SECONDS = 300
 VPN_NOTE = (
     "<b>Как получить VPN для H200</b>\n"
@@ -622,6 +623,91 @@ async def deliver_ascend_reminders(
         else:
             await asyncio.to_thread(storage.release_pending_reminder, request_id)
     return tuple(delivered)
+
+
+async def deliver_request_reminders(
+    bot: object,
+    storage: Storage,
+    admin_user_ids: frozenset[int],
+    *,
+    now: int,
+) -> tuple[str, ...]:
+    # A missed notification used to leave a server request pending forever:
+    # remind everyone who got it (admins and the chosen recommenders) daily.
+    await asyncio.to_thread(storage.recover_stale_pending_claims, now=now)
+    requests = await asyncio.to_thread(
+        storage.reserve_due_request_reminders, now=now
+    )
+    delivered = []
+    for request_id, application in requests:
+        earlier = await asyncio.to_thread(storage.request_messages, request_id)
+        previous = dict(earlier)
+        recipients = sorted(admin_user_ids) + [
+            chat_id
+            for chat_id in dict.fromkeys(chat for chat, _ in earlier)
+            if chat_id not in admin_user_ids
+        ]
+        text = (
+            "⏰ <b>Заявка на доступ всё ещё ждёт решения</b>\n\n"
+            + application_summary(application_data(application))
+            + "\n\nНажмите «Одобрить» или «Отклонить». Пока решения нет, бот "
+            "напомнит снова через сутки."
+        )
+        sent = False
+        for chat_id in recipients:
+            try:
+                message = await bot.send_message(
+                    chat_id,
+                    text,
+                    reply_markup=admin_approval_keyboard(request_id),
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Could not send request reminder %s to %s", request_id, chat_id
+                )
+                continue
+            sent = True
+            previous_id = previous.get(chat_id)
+            if previous_id is not None:
+                # one live copy per person: retire the buttons of the last one
+                with contextlib.suppress(Exception):
+                    await bot.edit_message_reply_markup(
+                        chat_id=chat_id, message_id=previous_id, reply_markup=None
+                    )
+            message_id = getattr(message, "message_id", None)
+            if message_id is not None:
+                # so the buttons are retired once someone handles the request
+                await asyncio.to_thread(
+                    storage.save_request_message, request_id, chat_id, message_id
+                )
+        if sent:
+            await asyncio.to_thread(
+                storage.mark_pending_reminder_sent,
+                request_id,
+                now=now,
+                interval_seconds=REQUEST_REMINDER_INTERVAL_SECONDS,
+            )
+            delivered.append(request_id)
+        else:
+            await asyncio.to_thread(storage.release_pending_reminder, request_id)
+    return tuple(delivered)
+
+
+async def run_request_reminder_loop(
+    bot: object,
+    storage: Storage,
+    admin_user_ids: frozenset[int],
+    *,
+    check_interval_seconds: int = 300,
+) -> None:
+    while True:
+        try:
+            await deliver_request_reminders(
+                bot, storage, admin_user_ids, now=int(time.time())
+            )
+        except Exception:
+            LOGGER.exception("Request reminder loop failed")
+        await asyncio.sleep(check_interval_seconds)
 
 
 ALIBABA_REQUESTS_CLOSED_TEXT = (
@@ -1318,10 +1404,11 @@ def build_router(
                 service.storage.save_pending_request,
                 request_id,
                 application,
-                remind_at=(
-                    int(time.time()) + ASCEND_REMINDER_INTERVAL_SECONDS
+                remind_at=int(time.time())
+                + (
+                    ASCEND_REMINDER_INTERVAL_SECONDS
                     if is_ascend
-                    else None
+                    else REQUEST_REMINDER_INTERVAL_SECONDS
                 ),
             )
         except PendingRequestExistsError:
@@ -2422,6 +2509,7 @@ async def run(settings: Settings) -> None:
     monitor_task = None
     disk_monitor_task = None
     ascend_reminder_task = None
+    request_reminder_task = None
     sheets_reconciliation_task = asyncio.create_task(
         run_sheets_reconciliation_loop(storage, sheets)
     )
@@ -2440,6 +2528,10 @@ async def run(settings: Settings) -> None:
     if settings.admin_user_ids and settings.alibaba_requests_open:
         ascend_reminder_task = asyncio.create_task(
             run_ascend_reminder_loop(bot, storage, settings.admin_user_ids)
+        )
+    if settings.admin_user_ids:
+        request_reminder_task = asyncio.create_task(
+            run_request_reminder_loop(bot, storage, settings.admin_user_ids)
         )
     if settings.gpu_monitor_enabled:
         policy = GpuIdlePolicy(
@@ -2524,6 +2616,10 @@ async def run(settings: Settings) -> None:
             ascend_reminder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await ascend_reminder_task
+        if request_reminder_task is not None:
+            request_reminder_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await request_reminder_task
         sheets_reconciliation_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sheets_reconciliation_task
