@@ -260,13 +260,29 @@ class SshProvisioner:
             helper,
             username,
         ]
-        completed = self.run(
-            command,
-            text=True,
-            capture_output=True,
-            timeout=120,
-            check=False,
-        )
+        completed = None
+        for attempt in range(3):
+            completed = self.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if completed.returncode == 0:
+                break
+            stderr = completed.stderr or ""
+            # rc 255 is an SSH transport blip. "group <user> exists" means the
+            # account is already in the directory (FreeIPA-backed host such as
+            # vv_h200) and the local useradd raced the LDAP sync; a short wait lets
+            # the helper's own getent find the user and return EXISTS rather than
+            # dying and failing the whole request.
+            retryable = completed.returncode == 255 or (
+                f"group {username} exists" in stderr
+            )
+            if not retryable or attempt == 2:
+                break
+            time.sleep(2 * (attempt + 1))
         if completed.returncode != 0:
             detail = completed.stderr.strip() or f"exit code {completed.returncode}"
             raise ProvisioningError(f"{host}: {detail}")
