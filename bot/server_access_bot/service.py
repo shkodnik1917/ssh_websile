@@ -5,6 +5,7 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from .domain import Application, Profile, ProvisionedAccess
+from .provisioning import VV_H200_CONNECTION, VV_H200_GROUP_URL
 from .storage import Storage
 
 
@@ -243,7 +244,10 @@ class AccessService:
             raise ValidationError(
                 "Доступ к Alibaba подтверждается администратором вручную."
             )
-        requested_hosts = list(application.servers)
+        # ipavlov first: it creates the FreeIPA account that vv_h200 also uses.
+        requested_hosts = sorted(
+            application.servers, key=lambda host: host != "ipavlov"
+        )
         missing_hosts = [
             host
             for host in requested_hosts
@@ -252,12 +256,29 @@ class AccessService:
                 application.telegram_user_id, host
             )
         ]
+        username = application.server_username
+        # Every server request is approved by a person first, so an account that
+        # already sits in the FreeIPA brainlab pool is the applicant's, not a
+        # collision: ipavlov reissues its password, and on vv_h200 it is the
+        # very same account. The nick check stays for local-account hosts.
+        vv_via_freeipa = False
+        if "vv_h200" in missing_hosts:
+            if self.storage.has_access(
+                application.telegram_user_id, "ipavlov"
+            ) or not self.provisioner.username_available("ipavlov", username):
+                vv_via_freeipa = True
+            elif "ipavlov" in application.servers:
+                # The ipavlov step creates the account, unless someone else's
+                # local VV account already holds the nick.
+                vv_via_freeipa = self.provisioner.username_available(
+                    "vv_h200", username
+                )
         unavailable = [
             host
             for host in missing_hosts
-            if not self.provisioner.username_available(
-                host, application.server_username
-            )
+            if host != "ipavlov"
+            and not (host == "vv_h200" and vv_via_freeipa)
+            and not self.provisioner.username_available(host, username)
         ]
         if unavailable:
             raise ValidationError(
@@ -268,14 +289,26 @@ class AccessService:
         self.storage.save_application(application)
         result = []
         for host in missing_hosts:
-            # full_name/owner_id are only consumed by hosts that create a named
-            # account (ipavlov FreeIPA); the others ignore them.
-            access = self.provisioner.provision(
-                host,
-                application.server_username,
-                full_name=application.full_name,
-                owner_id=application.telegram_user_id,
-            )
+            if host == "vv_h200" and vv_via_freeipa:
+                # No local useradd: it races the LDAP sync and would shadow the
+                # FreeIPA user. The password is the ipavlov one.
+                access = ProvisionedAccess(
+                    host="vv_h200",
+                    username=username,
+                    password=None,
+                    connection=VV_H200_CONNECTION.format(user=username),
+                    group_url=VV_H200_GROUP_URL,
+                    created=False,
+                )
+            else:
+                # full_name/owner_id are only consumed by hosts that create a
+                # named account (ipavlov FreeIPA); the others ignore them.
+                access = self.provisioner.provision(
+                    host,
+                    username,
+                    full_name=application.full_name,
+                    owner_id=application.telegram_user_id,
+                )
             self.storage.save_access(application.telegram_user_id, access)
             self.storage.record_event(
                 application.telegram_user_id,

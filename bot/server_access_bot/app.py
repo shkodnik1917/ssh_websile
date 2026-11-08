@@ -879,6 +879,8 @@ def server_dashboard_text(
         ]
         if access.password:
             lines.append(f"Пароль: <code>{html.escape(access.password)}</code>")
+        elif access.host == "vv_h200" and "ipavlov" in by_host:
+            lines.append("Пароль: тот же, что для ipavlov (одна учётка FreeIPA).")
         if access.connection:
             lines.append(f"Подключение: <code>{html.escape(access.connection)}</code>")
         if access.group_url:
@@ -1171,6 +1173,7 @@ def build_router(
         user: User,
         application: Application,
         bot: Bot,
+        errors: list[str] | None = None,
     ) -> bool:
         try:
             await asyncio.to_thread(service.submit, application)
@@ -1178,14 +1181,18 @@ def build_router(
                 service.credentials_for, application.telegram_user_id
             )
         except ValidationError as error:
+            if errors is not None:
+                errors.append(str(error))
             await bot.send_message(
                 chat_id,
                 str(error),
                 reply_markup=await personalized_main_menu(user.id),
             )
             return False
-        except ProvisioningError:
+        except ProvisioningError as error:
             LOGGER.exception("Provisioning failed for Telegram user %s", user.id)
+            if errors is not None:
+                errors.append(str(error))
             await bot.send_message(
                 chat_id,
                 "Не удалось создать доступ. Проверьте «Мои серверы»: часть "
@@ -1756,8 +1763,13 @@ def build_router(
             first_name=application.full_name,
             username=application.telegram_username,
         )
+        provisioning_errors: list[str] = []
         success = await provision_application(
-            application.telegram_user_id, applicant, application, bot
+            application.telegram_user_id,
+            applicant,
+            application,
+            bot,
+            errors=provisioning_errors,
         )
         await asyncio.to_thread(
             service.storage.resolve_pending_request,
@@ -1784,7 +1796,11 @@ def build_router(
             await callback.message.answer(
                 "Заявка одобрена, доступы отправлены пользователю."
                 if success
-                else "При выдаче произошла ошибка; пользователю отправлено уведомление."
+                else "При выдаче произошла ошибка: "
+                + html.escape(
+                    "; ".join(provisioning_errors) or "причина не указана"
+                )
+                + "\nПользователю отправлено уведомление."
             )
 
     @router.callback_query(F.data.startswith("admin:reject:"))

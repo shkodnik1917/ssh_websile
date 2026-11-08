@@ -751,3 +751,93 @@ def test_profile_recommender_ids_roundtrip(tmp_path: Path) -> None:
     )
     storage.save_profile(Profile(101, "alice_tg", "Alice Smith", "Bob (@bob)"))
     assert storage.profile_for(101).recommender_ids == ()
+
+
+def _freeipa_application(servers: tuple[str, ...]) -> Application:
+    return Application(
+        telegram_user_id=101,
+        telegram_username="alice_tg",
+        full_name="Alice Smith",
+        server_username="alice",
+        access_term="бессрочно",
+        recommender="Bob Jones",
+        activity="fine-tuning",
+        servers=servers,
+    )
+
+
+def test_existing_ipavlov_pool_account_is_reissued_not_rejected(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3", b"0" * 32)
+    provisioner = FakeProvisioner()
+    provisioner.unavailable.add(("ipavlov", "alice"))
+    service = AccessService(storage, provisioner)
+
+    service.submit(_freeipa_application(("ipavlov",)))
+
+    assert provisioner.calls == [("ipavlov", "alice")]
+    assert storage.has_access(101, "ipavlov")
+
+
+def test_vv_h200_with_ipavlov_reuses_the_freeipa_account(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3", b"0" * 32)
+    provisioner = FakeProvisioner()
+    service = AccessService(storage, provisioner)
+
+    result = service.submit(_freeipa_application(("vv_h200", "ipavlov")))
+
+    # ipavlov is provisioned first and no local useradd runs on vv_h200
+    assert provisioner.calls == [("ipavlov", "alice")]
+    vv = next(access for access in result if access.host == "vv_h200")
+    assert vv.password is None
+    assert vv.connection == "ssh -p 30018 alice@10.0.116.11"
+    assert storage.has_access(101, "vv_h200")
+
+
+def test_vv_h200_for_existing_freeipa_user_is_granted_without_useradd(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3", b"0" * 32)
+    provisioner = FakeProvisioner()
+    provisioner.unavailable |= {("ipavlov", "alice"), ("vv_h200", "alice")}
+    service = AccessService(storage, provisioner)
+
+    service.submit(_freeipa_application(("vv_h200",)))
+
+    assert provisioner.calls == []
+    assert storage.has_access(101, "vv_h200")
+
+
+def test_vv_h200_local_collision_is_still_rejected(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3", b"0" * 32)
+    provisioner = FakeProvisioner()
+    provisioner.unavailable.add(("vv_h200", "alice"))
+    service = AccessService(storage, provisioner)
+
+    with pytest.raises(ValidationError, match="vv_h200"):
+        service.submit(_freeipa_application(("vv_h200",)))
+    assert provisioner.calls == []
+
+
+def test_vv_h200_local_collision_is_rejected_even_with_new_ipavlov(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3", b"0" * 32)
+    provisioner = FakeProvisioner()
+    provisioner.unavailable.add(("vv_h200", "alice"))
+    service = AccessService(storage, provisioner)
+
+    with pytest.raises(ValidationError, match="vv_h200"):
+        service.submit(_freeipa_application(("ipavlov", "vv_h200")))
+    assert provisioner.calls == []
+
+
+def test_vv_h200_only_fresh_user_gets_a_local_account(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3", b"0" * 32)
+    provisioner = FakeProvisioner()
+    service = AccessService(storage, provisioner)
+
+    service.submit(_freeipa_application(("vv_h200",)))
+
+    assert provisioner.calls == [("vv_h200", "alice")]

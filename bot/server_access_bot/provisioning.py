@@ -34,6 +34,10 @@ IPAVLOV_SSH_HOST = "gpu12"
 IPAVLOV_HELPER = "/home/andrey_veprikov/.local/bin/brainlab-ipa"
 IPAVLOV_USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 IPAVLOV_CONNECTION = "ssh -J {user}@10.0.116.11:30018 {user}@gpu12.ipavlov.mipt.ru"
+# H200 (VV, ext1) authenticates the same FreeIPA account, so for a pool member
+# the VV account is the ipavlov one. Values mirror vv_h200 hermes-add-user.
+VV_H200_CONNECTION = "ssh -p 30018 {user}@10.0.116.11"
+VV_H200_GROUP_URL = "https://t.me/+uRqr0U1eF0JlMjYy"
 IPAVLOV_PASSWORD_RE = re.compile(r"(?m)^PASSWORD:\s*(.+)$")
 PASSWORD_LINE_RE = re.compile(r"(?im)^(\s*пароль:)\s*.*$")
 TIMESTAMP_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s*")

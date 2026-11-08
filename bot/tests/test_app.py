@@ -619,3 +619,29 @@ def test_approver_candidates_are_sorted_by_label() -> None:
         {"id": 1, "label": "Андрей Веприков (@shkodnik1917)"},
         {"id": 2, "label": "Глеб Молодцов (@hurrricane8)"},
     ]
+
+
+def test_vv_h200_freeipa_access_points_to_the_ipavlov_password() -> None:
+    accesses = [
+        ProvisionedAccess(
+            host="ipavlov",
+            username="alice",
+            password="pool-secret",
+            connection="ssh -J alice@10.0.116.11:30018 alice@gpu12.ipavlov.mipt.ru",
+            group_url="",
+            created=True,
+        ),
+        ProvisionedAccess(
+            host="vv_h200",
+            username="alice",
+            password=None,
+            connection="ssh -p 30018 alice@10.0.116.11",
+            group_url="https://t.me/+uRqr0U1eF0JlMjYy",
+            created=False,
+        ),
+    ]
+
+    text = server_dashboard_text(accesses)
+
+    assert "тот же, что для ipavlov" in text
+    assert "ssh -p 30018 alice@10.0.116.11" in text
