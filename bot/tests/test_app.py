@@ -418,6 +418,7 @@ def test_main_menu_exposes_profile_catalog_info_and_access_actions() -> None:
         ["👤 Мой профиль", "🔐 Мои серверы"],
         ["🖥 Все серверы лаборатории", "➕ Получить доступ"],
         ["📚 Сайт и правила", "📡 Статус серверов"],
+        ["📈 Нагрузка за неделю"],
         ["🧠 База знаний MCP", "📂 Доступ к работам"],
     ]
     access_button = MAIN_MENU.keyboard[1][1]

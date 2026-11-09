@@ -6,6 +6,7 @@ import json
 import logging
 import secrets
 import time
+from datetime import datetime
 from collections.abc import Sequence
 from urllib.parse import urlencode, urlparse
 
@@ -53,12 +54,20 @@ from .domain import (
     RegistryMatch,
     ServerRequest,
 )
+from .gpu_history import (
+    LOAD_HISTORY_BUTTON,
+    RETENTION_SECONDS as GPU_HISTORY_RETENTION_SECONDS,
+    GpuLoadHistory,
+    format_gpu_load_history,
+    run_gpu_load_history_loop,
+)
 from .monitoring import (
     PUBLIC_SERVER_NAMES,
     STATUS_ONLY_SERVER_NAMES,
     GpuFleetScanner,
     GpuIdleMonitor,
     GpuIdlePolicy,
+    MOSCOW_TIMEZONE,
     GpuStatusScanner,
     format_gpu_status,
     run_gpu_idle_monitor,
@@ -215,6 +224,7 @@ def main_menu(
                 KeyboardButton(text="📚 Сайт и правила"),
                 KeyboardButton(text="📡 Статус серверов"),
             ],
+            [KeyboardButton(text=LOAD_HISTORY_BUTTON)],
             [KeyboardButton(text=MCP_MENU), KeyboardButton(text=WORKS_BUTTON)],
         ],
         resize_keyboard=True,
@@ -1071,6 +1081,7 @@ def build_router(
     mcp_service: McpAccessService | None = None,
     alibaba_requests_open: bool = True,
     closed_servers: frozenset[str] = frozenset(),
+    gpu_load_history: GpuLoadHistory | None = None,
 ) -> Router:
     router = Router()
 
@@ -2196,6 +2207,25 @@ def build_router(
         statuses = await asyncio.to_thread(gpu_status_scanner.scan)
         await progress.edit_text(format_gpu_status(statuses))
 
+    @router.message(Command("load"))
+    @router.message(F.text == LOAD_HISTORY_BUTTON)
+    async def gpu_load(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        if gpu_load_history is None or gpu_status_scanner is None:
+            await message.answer("Статистика нагрузки временно недоступна.")
+            return
+        samples = await asyncio.to_thread(
+            gpu_load_history.samples_since,
+            int(time.time()) - GPU_HISTORY_RETENTION_SECONDS,
+        )
+        await message.answer(
+            format_gpu_load_history(
+                samples,
+                gpu_status_scanner.hosts,
+                now=datetime.now(MOSCOW_TIMEZONE),
+            )
+        )
+
     @router.message(Command("disk_status"))
     async def disk_status(message: Message, state: FSMContext) -> None:
         await state.clear()
@@ -2470,6 +2500,7 @@ async def run(settings: Settings) -> None:
         status_hosts + tuple(STATUS_ONLY_SERVER_NAMES)
     )
     disk_scanner = DiskScanner(monitored_hosts)
+    gpu_load_history = GpuLoadHistory(settings.database_path)
     sheets = GoogleSheetsRepository(
         settings.google_service_account_file,
         settings.spreadsheet_id,
@@ -2507,7 +2538,11 @@ async def run(settings: Settings) -> None:
             mcp_service=mcp_service,
             alibaba_requests_open=settings.alibaba_requests_open,
             closed_servers=settings.closed_servers,
+            gpu_load_history=gpu_load_history,
         )
+    )
+    gpu_load_history_task = asyncio.create_task(
+        run_gpu_load_history_loop(gpu_status_scanner, gpu_load_history)
     )
     monitor_task = None
     disk_monitor_task = None
@@ -2597,6 +2632,7 @@ async def run(settings: Settings) -> None:
             BotCommand(command="servers", description="Показать мои серверы"),
             BotCommand(command="mcp", description="Доступ к базе знаний лаборатории"),
             BotCommand(command="status", description="Показать загрузку серверов"),
+            BotCommand(command="load", description="Нагрузка серверов за неделю"),
             BotCommand(command="disk_status", description="Показать свободное место"),
             BotCommand(command="demo", description="Безопасно проверить onboarding"),
             BotCommand(command="cancel", description="Отменить текущее действие"),
@@ -2607,6 +2643,9 @@ async def run(settings: Settings) -> None:
             bot, allowed_updates=dispatcher.resolve_used_update_types()
         )
     finally:
+        gpu_load_history_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await gpu_load_history_task
         if monitor_task is not None:
             monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
