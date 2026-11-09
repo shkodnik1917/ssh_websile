@@ -19,6 +19,7 @@ from server_access_bot.monitoring import (
     GpuIdlePolicy,
     GpuScan,
     GpuStatusScanner,
+    STATUS_ONLY_SERVER_NAMES,
     confirmed_driver_hangs,
     deliver_driver_hang_alerts,
     deliver_gpu_idle_incidents,
@@ -587,3 +588,36 @@ def test_guard_waits_out_a_slow_but_alive_nvidia_smi(tmp_path) -> None:
 
     assert result.returncode == 0
     assert "GPU-x" in result.stdout
+
+
+def test_server_status_shows_ipavlov_gpu12_and_h200_slurm_pool() -> None:
+    gpu_output = "0, GPU-aaaa, NVIDIA A100-SXM4-80GB, 81920, 40960, 40960, 100\n"
+    slurm_output = (
+        "N|gpu13|gpu:h200:8(S:0,3),shard:h200:32(S:0,3)|gpu:h200:6(IDX:0-4,6),shard:h200:0(0/4)|mix\n"
+        "N|gpu14|gpu:h200:8(S:0-1),shard:h200:32(S:0-1)|gpu:h200:2(IDX:0,4),shard:h200:0(0/4)|mix\n"
+        "L|Total=32 Used=32\n"
+    )
+
+    def runner(host: str, command: tuple[str, ...]) -> tuple[int, str]:
+        if host == "ipavlov_slurm":
+            assert command == GpuStatusScanner.IPAVLOV_SLURM_QUERY
+            return 0, slurm_output
+        assert command == GpuStatusScanner.GPU_QUERY
+        return 0, gpu_output
+
+    statuses = GpuStatusScanner(
+        hosts=tuple(STATUS_ONLY_SERVER_NAMES), runner=runner
+    ).scan()
+    text = format_gpu_status(statuses)
+
+    assert "🟢 <b>iPavlov · gpu12 (общий пул)</b>" in text
+    assert "GPU 0 · NVIDIA A100-SXM4-80GB" in text
+    assert "🟢 <b>iPavlov · H200 Slurm</b>" in text
+    assert "GPU   ███░░ 8/16 занято (50%)" in text
+    assert "gpu13 6/8 · gpu14 2/8" in text
+    assert "квота BrainLab (h200_brainlab): 32/32 занято" in text
+    assert "Slurm partition: gpu · состояние: mix" in text
+
+
+def test_status_only_hosts_stay_out_of_disk_and_idle_monitoring() -> None:
+    assert not set(STATUS_ONLY_SERVER_NAMES) & set(PUBLIC_SERVER_NAMES)

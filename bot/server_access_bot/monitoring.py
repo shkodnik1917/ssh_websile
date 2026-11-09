@@ -6,6 +6,7 @@ import secrets
 import shlex
 import subprocess
 import time
+from pathlib import Path
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,14 @@ PUBLIC_SERVER_NAMES = {
     "2_a100_brain": "2 × A100 (BrainLab)",
     "alibaba_ascend": "Alibaba",
 }
+# Shown only in "Статус серверов": no disk watch, no idle-process control there.
+STATUS_ONLY_SERVER_NAMES = {
+    "gpu12": "iPavlov · gpu12 (общий пул)",
+    "ipavlov_slurm": "iPavlov · H200 Slurm",
+}
+# Login node accepts only the FreeIPA password; root-only file, see servers notes.
+IPAVLOV_SLURM_PASSWORD_FILE = "/etc/ipavlov/freeipa.pw"
+IPAVLOV_SLURM_TARGET = "ipavlov-slurm"
 SERVER_LOCATIONS = {
     "shkodnik_opt": "старом сервере (MIPT)",
     "brain_lab": "новом сервере (BrainLab)",
@@ -178,6 +187,21 @@ class GpuFleetScanner:
     @staticmethod
     def _run_ssh(host: str, command: tuple[str, ...]) -> tuple[int, str]:
         target = ["--", host]
+        launcher = ["/usr/bin/ssh", "-o", "BatchMode=yes"]
+        env = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": "/root",
+            "LANG": "C.UTF-8",
+        }
+        if host == "ipavlov_slurm":
+            try:
+                env["SSHPASS"] = (
+                    Path(IPAVLOV_SLURM_PASSWORD_FILE).read_text().rstrip("\n")
+                )
+            except OSError:
+                return 255, ""
+            launcher = ["/usr/bin/sshpass", "-e", "/usr/bin/ssh"]
+            target = ["--", IPAVLOV_SLURM_TARGET]
         if host == "alibaba_ascend":
             target = [
                 "-i",
@@ -189,9 +213,7 @@ class GpuFleetScanner:
             ]
         completed = subprocess.run(
             [
-                "/usr/bin/ssh",
-                "-o",
-                "BatchMode=yes",
+                *launcher,
                 "-o",
                 "ConnectTimeout=8",
                 "-o",
@@ -207,11 +229,7 @@ class GpuFleetScanner:
             text=True,
             timeout=45,
             check=False,
-            env={
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "HOME": "/root",
-                "LANG": "C.UTF-8",
-            },
+            env=env,
         )
         return completed.returncode, completed.stdout
 
@@ -342,6 +360,17 @@ class GpuStatusScanner:
         "\"$gpu_cap\" \"$gpu_alloc\" \"$shard_cap\" \"$shard_alloc\" \"$state\"",
     )
 
+    # gpu13/gpu14 behind slurm-login: per-node GPUs in use, plus the BrainLab
+    # license (h200_brainlab) that caps how much of the pool the lab may hold.
+    IPAVLOV_SLURM_QUERY = (
+        "/bin/sh",
+        "-lc",
+        "sinfo -h -p gpu -N -O NodeList:40,Gres:200,GresUsed:200,StateCompact:20 | "
+        "awk '{print \"N|\" $1 \"|\" $2 \"|\" $3 \"|\" $4}'; "
+        "scontrol show lic h200_brainlab | grep -o 'Total=[0-9]* Used=[0-9]*' | "
+        "sed 's/^/L|/'",
+    )
+
     def __init__(
         self,
         hosts: Sequence[str],
@@ -350,15 +379,16 @@ class GpuStatusScanner:
         self.hosts = tuple(hosts)
         self.runner = runner or GpuFleetScanner._run_ssh
 
+    def _summary_query(self, host: str) -> tuple[str, ...] | None:
+        return {
+            "alibaba_ascend": self.ALIBABA_QUERY,
+            "ipavlov_slurm": self.IPAVLOV_SLURM_QUERY,
+        }.get(host)
+
     def scan(self) -> tuple[ServerGpuStatus, ...]:
         def safe_run(host: str) -> tuple[int, str]:
             try:
-                command = (
-                    self.ALIBABA_QUERY
-                    if host == "alibaba_ascend"
-                    else self.GPU_QUERY
-                )
-                return self.runner(host, command)
+                return self.runner(host, self._summary_query(host) or self.GPU_QUERY)
             except (OSError, subprocess.SubprocessError, TimeoutError):
                 return 255, ""
 
@@ -368,7 +398,8 @@ class GpuStatusScanner:
         statuses = []
         for host in self.hosts:
             return_code, output = futures[host].result()
-            if return_code == DRIVER_HUNG_EXIT_CODE and host != "alibaba_ascend":
+            summary_host = self._summary_query(host) is not None
+            if return_code == DRIVER_HUNG_EXIT_CODE and not summary_host:
                 statuses.append(
                     ServerGpuStatus(
                         host=host, reachable=True, devices=(), driver_hung=True
@@ -381,17 +412,61 @@ class GpuStatusScanner:
                     reachable=return_code == 0,
                     devices=(
                         self._parse_devices(output)
-                        if return_code == 0 and host != "alibaba_ascend"
+                        if return_code == 0 and not summary_host
                         else ()
                     ),
                     summary=(
-                        self._parse_alibaba_summary(output)
-                        if return_code == 0 and host == "alibaba_ascend"
+                        self._parse_summary(host, output)
+                        if return_code == 0 and summary_host
                         else None
                     ),
                 )
             )
         return tuple(statuses)
+
+    @classmethod
+    def _parse_summary(cls, host: str, text: str) -> str | None:
+        if host == "ipavlov_slurm":
+            return cls._parse_ipavlov_slurm_summary(text)
+        return cls._parse_alibaba_summary(text)
+
+    @staticmethod
+    def _parse_ipavlov_slurm_summary(text: str) -> str | None:
+        gpu_count = re.compile(r"gpu:(?:[^:,()]+:)?(\d+)")
+        nodes = []
+        states = []
+        license_line = None
+        for raw in text.splitlines():
+            parts = raw.strip().split("|")
+            if parts[0] == "N" and len(parts) == 5:
+                total = gpu_count.search(parts[2])
+                used = gpu_count.search(parts[3])
+                if total is None or used is None or int(total.group(1)) == 0:
+                    continue
+                nodes.append((parts[1], int(used.group(1)), int(total.group(1))))
+                if parts[4] and parts[4] not in states:
+                    states.append(parts[4])
+            elif parts[0] == "L" and len(parts) == 2:
+                match = re.fullmatch(r"Total=(\d+) Used=(\d+)", parts[1].strip())
+                if match:
+                    license_line = (
+                        f"квота BrainLab (h200_brainlab): "
+                        f"{match.group(2)}/{match.group(1)} занято"
+                    )
+        if not nodes:
+            return None
+        used_total = sum(used for _, used, _ in nodes)
+        gpu_total = sum(total for _, _, total in nodes)
+        if used_total > gpu_total:
+            return None
+        lines = [
+            _allocation_line("GPU  ", used_total, gpu_total),
+            " · ".join(f"{name} {used}/{total}" for name, used, total in nodes),
+        ]
+        if license_line:
+            lines.append(license_line)
+        lines.append(f"Slurm partition: gpu · состояние: {','.join(states) or '?'}")
+        return "\n".join(lines)
 
     @staticmethod
     def _parse_alibaba_summary(text: str) -> str | None:
@@ -411,16 +486,9 @@ class GpuStatusScanner:
             return None
         availability = parts[4].strip()
         state = parts[5].strip()
-
-        def line(label: str, allocated: int, total: int) -> str:
-            percent = round(100 * allocated / total)
-            filled = min(5, (percent + 19) // 20)
-            bar = "█" * filled + "░" * (5 - filled)
-            return f"{label} {bar} {allocated}/{total} занято ({percent}%)"
-
-        lines = [line("GPU  ", gpu_alloc, gpu_total)]
+        lines = [_allocation_line("GPU  ", gpu_alloc, gpu_total)]
         if shard_total and shard_alloc is not None and shard_alloc <= shard_total:
-            lines.append(line("шарды", shard_alloc, shard_total))
+            lines.append(_allocation_line("шарды", shard_alloc, shard_total))
         lines.append(f"Slurm partition: labs-pool · состояние: {state or availability}")
         return "\n".join(lines)
 
@@ -458,6 +526,13 @@ class GpuStatusScanner:
         return tuple(sorted(devices, key=lambda device: device.index))
 
 
+def _allocation_line(label: str, allocated: int, total: int) -> str:
+    percent = round(100 * allocated / total)
+    filled = min(5, (percent + 19) // 20)
+    bar = "█" * filled + "░" * (5 - filled)
+    return f"{label} {bar} {allocated}/{total} занято ({percent}%)"
+
+
 def format_gpu_status(
     statuses: Sequence[ServerGpuStatus],
     *,
@@ -470,7 +545,10 @@ def format_gpu_status(
         f"Обновлено: {timestamp:%d.%m.%Y, %H:%M} МСК",
     ]
     for status in statuses:
-        server_name = html.escape(PUBLIC_SERVER_NAMES.get(status.host, status.host))
+        server_name = html.escape(
+            PUBLIC_SERVER_NAMES.get(status.host)
+            or STATUS_ONLY_SERVER_NAMES.get(status.host, status.host)
+        )
         if not status.reachable:
             sections.append(
                 f"🔴 <b>{server_name}</b>\nСервер недоступен по SSH."

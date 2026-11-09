@@ -55,6 +55,7 @@ from .domain import (
 )
 from .monitoring import (
     PUBLIC_SERVER_NAMES,
+    STATUS_ONLY_SERVER_NAMES,
     GpuFleetScanner,
     GpuIdleMonitor,
     GpuIdlePolicy,
@@ -2465,7 +2466,9 @@ async def run(settings: Settings) -> None:
     monitored_hosts = tuple(
         host for host in status_hosts if host != "alibaba_ascend"
     )
-    gpu_status_scanner = GpuStatusScanner(status_hosts)
+    gpu_status_scanner = GpuStatusScanner(
+        status_hosts + tuple(STATUS_ONLY_SERVER_NAMES)
+    )
     disk_scanner = DiskScanner(monitored_hosts)
     sheets = GoogleSheetsRepository(
         settings.google_service_account_file,
