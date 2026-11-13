@@ -4,7 +4,9 @@ import json
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import EditMessageText, SendMessage
+import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import DeleteMessage, EditMessageText, SendMessage
 from aiogram.types import (
     CallbackQuery,
     Chat,
@@ -21,9 +23,10 @@ from server_access_bot.storage import Storage
 
 
 class Telegram(BaseSession):
-    def __init__(self):
+    def __init__(self, refuse_delete=False):
         super().__init__()
         self.sent = []
+        self.refuse_delete = refuse_delete
 
     async def close(self):
         pass
@@ -33,6 +36,8 @@ class Telegram(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.sent.append(method)
+        if isinstance(method, DeleteMessage) and self.refuse_delete:
+            raise TelegramBadRequest(method, "message can't be deleted")
         if isinstance(method, SendMessage):
             return Message(
                 message_id=len(self.sent),
@@ -76,11 +81,12 @@ def test_request_messages_roundtrip(tmp_path):
     assert storage.request_messages("req-2") == [(3, 300)]
 
 
-def test_resolving_a_request_clears_the_other_approvers_message(tmp_path):
+@pytest.mark.parametrize("refuse_delete", [False, True])
+def test_resolving_a_request_clears_the_other_approvers_message(tmp_path, refuse_delete):
     async def scenario():
         storage = Storage(tmp_path / "db", b"a" * 32)
         storage.save_profile(Profile(42, "alice_tg", "Alice Smith", "Bob Jones"))
-        telegram = Telegram()
+        telegram = Telegram(refuse_delete=refuse_delete)
         bot = Bot("123456:abcdef", session=telegram)
         dispatcher = Dispatcher()
         dispatcher.include_router(
@@ -128,12 +134,20 @@ def test_resolving_a_request_clears_the_other_approvers_message(tmp_path):
             bot, Update(update_id=2, callback_query=callback)
         )
 
-        # Admin 2's dangling message was rewritten and its buttons removed.
-        edits = [x for x in telegram.sent if isinstance(x, EditMessageText)]
-        other = next(e for e in edits if e.chat_id == 2)
-        assert other.message_id == stored[2]
-        assert "отклонил" in other.text
-        assert other.reply_markup is None
+        # Admin 2's dangling message is deleted, so "already handled" notes do not
+        # pile up; when Telegram refuses (older than 48 h) it is rewritten instead,
+        # naming whose request it was.
+        deletes = [x for x in telegram.sent if isinstance(x, DeleteMessage) and x.chat_id == 2]
+        assert [d.message_id for d in deletes] == [stored[2]]
+        edits = [x for x in telegram.sent if isinstance(x, EditMessageText) and x.chat_id == 2]
+        if refuse_delete:
+            (other,) = edits
+            assert other.message_id == stored[2]
+            assert "отклонил" in other.text
+            assert "Alice Smith (@alice_tg)" in other.text
+            assert other.reply_markup is None
+        else:
+            assert edits == []
 
         # The applicant was told, and the fan-out bookkeeping is cleared.
         assert any(

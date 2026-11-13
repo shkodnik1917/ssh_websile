@@ -95,7 +95,7 @@ def parse_web_app_data(user: User, raw_data: str) -> Profile | ServerRequest:
         not isinstance(host, str) for host in servers
     ):
         raise _invalid_payload()
-    if len(servers) > 4 + int("mcp" in servers) or len(servers) != len(set(servers)):
+    if len(servers) != len(set(servers)):
         raise _invalid_payload()
     mcp_role = data.get("mcp_role") if "mcp" in servers else None
     if "mcp" in servers and (not isinstance(mcp_role, str) or mcp_role not in ROLES):

@@ -136,3 +136,14 @@ def test_profile_payload_rejects_bad_recommender_ids(bad) -> None:
             "version": 1, "kind": "profile", "full_name": "Al Smith",
             "recommender": "", "recommender_ids": bad,
         }))
+
+
+def test_server_request_accepts_every_server_in_the_form() -> None:
+    user = User(id=4242, is_bot=False, first_name="Alice", username="alice_tg")
+    payload = valid_payload()
+    payload["servers"] = [
+        "ipavlov", "shkodnik_opt", "brain_lab", "vv_h200", "2_a100_brain", "alibaba_ascend",
+    ]
+    submission = parse_web_app_data(user, json.dumps(payload))
+    assert isinstance(submission, ServerRequest)
+    assert len(submission.servers) == 6

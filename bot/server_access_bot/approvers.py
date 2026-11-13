@@ -5,6 +5,7 @@
 импорта (app импортирует mcp_router)."""
 
 import html
+import re
 
 from .storage import Storage
 
@@ -40,6 +41,29 @@ def approver_candidates(
     ]
     candidates.sort(key=lambda item: str(item["label"]).casefold())
     return candidates
+
+
+def _words(text: str) -> set[str]:
+    return {word.casefold().replace("ё", "е") for word in re.findall(r"[^\W\d_]+", text)}
+
+
+def match_recommenders(text: str, labels: dict[int, str]) -> tuple[int, ...]:
+    """Старые профили хранят рекомендателя только текстом («Иван Петров»), без id,
+    и такая заявка уходила одному владельцу. Сопоставляем текст с теми, кто может
+    одобрять: по @нику или по всем словам имени в любом порядке."""
+    if not text.strip():
+        return ()
+    nicks = {nick.casefold() for nick in re.findall(r"@(\w+)", text)}
+    text_words = _words(re.sub(r"@\w+", " ", text))
+    matched = []
+    for approver_id, label in sorted(labels.items()):
+        nick = re.search(r"@(\w+)", label)
+        name_words = _words(re.sub(r"\(?@\w+\)?", " ", label))
+        if (nick and nick.group(1).casefold() in nicks) or (
+            len(name_words) >= 2 and name_words <= text_words
+        ):
+            matched.append(approver_id)
+    return tuple(matched)
 
 
 def also_sent_line(labels: dict[int, str], *, exclude: int) -> str:

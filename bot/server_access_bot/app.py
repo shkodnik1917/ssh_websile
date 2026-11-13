@@ -95,6 +95,7 @@ from .approvers import (
     approver_candidates,
     approver_label,
     approver_label_map,
+    match_recommenders,
 )
 from .webapp import parse_web_app_data
 
@@ -567,6 +568,17 @@ def registry_match_from_data(data: dict[str, object]) -> RegistryMatch:
             else None
         ),
     )
+
+
+def application_title(application: Application) -> str:
+    """«Мария Иванова (@maria_iv) на 2 × A100 (BrainLab)», уже экранировано."""
+    who = application.full_name
+    if application.telegram_username:
+        who += f" (@{application.telegram_username.lstrip('@')})"
+    servers = ", ".join(
+        ALL_SERVICE_NAMES.get(host, host) for host in application.servers
+    )
+    return html.escape(f"{who} на {servers}")
 
 
 def application_summary(data: dict[str, object]) -> str:
@@ -1107,11 +1119,19 @@ def build_router(
     async def profile_menu() -> ReplyKeyboardMarkup:
         return profile_form_menu(await recommender_choices())
 
+    def recommenders_by_name(text: str) -> tuple[int, ...]:
+        approvers = server_approvers()
+        return match_recommenders(
+            text, approver_label_map(service.storage, approvers)
+        )
+
     async def normalize_recommenders(profile: Profile) -> Profile:
         # Доверяем форме только id, и только тем, кто сейчас реально может одобрять;
         # человекочитаемую подпись пересобираем из имён, а не из присланного текста.
         approvers = server_approvers()
         valid = tuple(rid for rid in profile.recommender_ids if rid in approvers)
+        if not valid and profile.recommender:
+            valid = await asyncio.to_thread(recommenders_by_name, profile.recommender)
         labels = await asyncio.to_thread(
             approver_label_map, service.storage, frozenset(valid)
         )
@@ -1397,6 +1417,13 @@ def build_router(
             )
             return
         request_id = secrets.token_urlsafe(8)
+        if not application.recommender_ids and application.recommender:
+            application = dataclasses.replace(
+                application,
+                recommender_ids=await asyncio.to_thread(
+                    recommenders_by_name, application.recommender
+                ),
+            )
         is_ascend = application.servers == ("alibaba_ascend",)
         if is_ascend and not alibaba_requests_open:
             await message.answer(
@@ -1822,13 +1849,24 @@ def build_router(
         note: str,
     ) -> None:
         # Заявку обрабатывает первый нажавший; у остальных получателей сообщение с
-        # кнопками гасим, чтобы оно не висело «живым» и было понятно, кто решил.
+        # кнопками убираем совсем, чтобы не копились «уже одобрил». Telegram даёт
+        # боту удалить своё сообщение только в первые 48 часов; старше — переписываем
+        # в строку, где видно, чья заявка и кто решил.
         messages = await asyncio.to_thread(
             service.storage.request_messages, request_id
         )
         for chat_id, message_id in messages:
             if chat_id == actor_id and message_id == actor_message_id:
                 continue
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                continue
+            except Exception:
+                LOGGER.info(
+                    "Could not delete approver message %s/%s, editing it",
+                    chat_id,
+                    message_id,
+                )
             try:
                 await bot.edit_message_text(
                     note, chat_id=chat_id, message_id=message_id
@@ -1888,8 +1926,8 @@ def build_router(
             request_id,
             callback.from_user.id,
             callback.message.message_id if callback.message else None,
-            f"✅ Заявку уже одобрил: {html.escape(actor_label)}.\n"
-            "От вас ничего не требуется.",
+            f"✅ Заявку {application_title(application)} одобрил: "
+            f"{html.escape(actor_label)}.\nОт вас ничего не требуется.",
         )
         if callback.message:
             await callback.message.answer(
@@ -1938,8 +1976,8 @@ def build_router(
             request_id,
             callback.from_user.id,
             callback.message.message_id if callback.message else None,
-            f"🚫 Заявку отклонил: {html.escape(actor_label)}.\n"
-            "От вас ничего не требуется.",
+            f"🚫 Заявку {application_title(application)} отклонил: "
+            f"{html.escape(actor_label)}.\nОт вас ничего не требуется.",
         )
 
     @router.callback_query(F.data.startswith("gpu:stop:"))
