@@ -109,9 +109,23 @@ def test_server_status_shows_alibaba_pool_gpu_and_shard_allocation() -> None:
     text = format_gpu_status(statuses)
 
     assert "🟢 <b>Alibaba</b>" in text
-    assert "GPU   ██░░░ 2/8 занято (25%)" in text
-    assert "шарды ███░░ 8/16 занято (50%)" in text
+    # 2 whole cards hold 4 shards; 8 shards sit on at least 4 more cards.
+    assert "GPU   ████░ 6/8 занято (75%)" in text
+    assert "шарды ████░ 12/16 занято (75%)" in text
     assert "Slurm partition: labs-pool · состояние: mix" in text
+
+
+def test_alibaba_whole_cards_count_as_busy_shards() -> None:
+    def runner(host: str, command: tuple[str, ...]) -> tuple[int, str]:
+        return 0, "8|8|16|0|up|mix\n"
+
+    statuses = GpuStatusScanner(
+        hosts=("alibaba_ascend",), runner=runner
+    ).scan()
+    text = format_gpu_status(statuses)
+
+    assert "GPU   █████ 8/8 занято (100%)" in text
+    assert "шарды █████ 16/16 занято (100%)" in text
 
 
 def test_alibaba_summary_omits_shard_line_when_no_shards() -> None:

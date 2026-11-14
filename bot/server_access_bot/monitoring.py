@@ -486,9 +486,20 @@ class GpuStatusScanner:
             return None
         availability = parts[4].strip()
         state = parts[5].strip()
-        lines = [_allocation_line("GPU  ", gpu_alloc, gpu_total)]
-        if shard_total and shard_alloc is not None and shard_alloc <= shard_total:
-            lines.append(_allocation_line("шарды", shard_alloc, shard_total))
+        if not (shard_total and shard_alloc is not None and shard_alloc <= shard_total):
+            lines = [_allocation_line("GPU  ", gpu_alloc, gpu_total)]
+        else:
+            # Шарды нарезаны из тех же карт pool: карта, взятая целиком, съедает свои
+            # шарды, а карта с хоть одним занятым шардом целиком уже не выдаётся.
+            # Slurm считает gpu и shard раздельно, поэтому сводим сами (по шардам на
+            # карту; для GPU это нижняя оценка — шарды могут лежать на разных картах).
+            per_gpu = max(1, shard_total // gpu_total)
+            busy_gpus = min(gpu_total, gpu_alloc + -(-shard_alloc // per_gpu))
+            busy_shards = min(shard_total, shard_alloc + gpu_alloc * per_gpu)
+            lines = [
+                _allocation_line("GPU  ", busy_gpus, gpu_total),
+                _allocation_line("шарды", busy_shards, shard_total),
+            ]
         lines.append(f"Slurm partition: labs-pool · состояние: {state or availability}")
         return "\n".join(lines)
 
