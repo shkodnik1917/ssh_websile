@@ -180,6 +180,11 @@ class AccessService:
 
     def validate_request(self, application: Application) -> None:
         validate(application)
+        if "2_a100_brain" in application.servers:
+            raise ValidationError(
+                "Сервер 2 × A100 (BrainLab) временно не работает. "
+                "Приём заявок приостановлен."
+            )
         current_username = self.storage.server_username_for(
             application.telegram_user_id
         )
