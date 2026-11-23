@@ -807,7 +807,8 @@ def available_servers_text() -> str:
         "вернитесь в бот и отправьте заявку через «➕ Получить доступ». "
         "Без VPN подключение по SSH недоступно.\n\n"
         "<b>2 × A100 (BrainLab)</b>\n"
-        "Временно не работает. Приём заявок приостановлен.\n\n"
+        "2 × A100 80 GB. Только из сети МФТИ или через VPN МФТИ, "
+        "без выхода в интернет.\n\n"
         "<b>mlsub / Cloud.ru</b>\n"
         "отдельный вычислительный сервис для запуска задач в очереди Cloud.ru. "
         "Для заявки нужен уже выданный доступ к BrainLab. mlsub включается "
@@ -1007,7 +1008,6 @@ def server_dashboard_text(
         if access.host == "vv_h200":
             lines.append(VPN_NOTE)
         if access.host == "2_a100_brain":
-            lines.append("⏸ Сервер временно не работает. Приём заявок приостановлен.")
             lines.append(MIPT_NETWORK_NOTE)
         if access.host == "ipavlov":
             lines.append(IPAVLOV_NOTE.format(user=access.username))
